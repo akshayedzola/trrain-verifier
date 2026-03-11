@@ -79,9 +79,15 @@ Required fields to extract:
 - reporting_manager (optional)
 
 Also assess:
-- overall_completeness_score: 0-100 (how complete is the letter)
+- is_offer_letter: true or false — is this actually an employment offer letter? Be strict. Policy documents, HR handbooks, attendance sheets, appointment confirmations, NOCs, experience letters, salary slips are NOT offer letters.
+- document_type: short label for what this document is (e.g. "offer letter", "attendance policy", "salary slip", "experience letter", "HR policy", "unknown")
+- overall_completeness_score: 0-100 (how complete is the letter AS AN OFFER LETTER — if not an offer letter, set to 0)
 - missing_fields: list of fields not found
-- suspicious_text_patterns: list of any suspicious patterns you notice (e.g., placeholder text, inconsistent formatting, copy-pasted sections, generic templates)
+- suspicious_text_patterns: list of any suspicious patterns you notice (e.g., placeholder text like "[Name]" or "[Date]", inconsistent formatting, copy-pasted boilerplate, generic templates with unfilled fields)
+- has_placeholder_text: true or false — are there any unfilled template placeholders like [Candidate Name], [Date], [Salary], etc.?
+- employer_email_domain: extract just the domain part of employer email if present (e.g. "relianceindustries.com") or null
+- employer_email_is_free: true if employer email uses gmail/yahoo/hotmail/outlook.com/rediffmail/ymail — false otherwise — null if no email found
+- joining_date_iso: the joining date reformatted as YYYY-MM-DD if you can parse it, otherwise null
 - text_quality: "high", "medium", or "low"
 - language_consistency: true/false (is the language consistent throughout)
 
@@ -430,8 +436,10 @@ def layer5_historical_comparison(text, employer_name, fields):
         # Check for exact duplicate (suspicious)
         for past in past_docs:
             if past["hash"] == fingerprint["hash"]:
+                result["is_exact_duplicate"] = True
+                result["duplicate_processed_at"] = past.get("processed_at", "unknown date")
                 result["anomalies"].append("Exact duplicate of previously seen document")
-                result["signals"].append({"type": "danger", "msg": "This document is an exact duplicate of a previously processed letter"})
+                result["signals"].append({"type": "danger", "msg": f"EXACT DUPLICATE — this document was already processed on {past.get('processed_at','unknown')[:10]}. Possible reuse/recycling."})
     else:
         result["signals"].append({"type": "info", "msg": f"First time seeing letters from '{employer_name}' — no historical baseline yet"})
     
@@ -536,8 +544,183 @@ def layer6_geotag_verification(image_file=None, employer_address=None, joining_d
 # ─────────────────────────────────────────────
 # SCORING ENGINE
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# INPUT VALIDATION GATE
+# Abort before scoring if the document is unreadable/empty/corrupted
+# ─────────────────────────────────────────────
+def validate_inputs(l1, l2):
+    """Returns (ok: bool, reason: str)"""
+    text = l1.get("text", "")
+    page_count = l1.get("page_count", 0)
+    extraction_method = l1.get("extraction_method", "native")
+
+    if l1.get("error"):
+        return False, f"PDF could not be opened: {l1['error']}"
+    if page_count == 0:
+        return False, "PDF has 0 pages — file may be corrupted or empty"
+    if len(text.strip()) < 80 and extraction_method != "image_based_ocr_needed":
+        return False, f"Extracted text too short ({len(text.strip())} chars) — possibly a blank, encrypted, or image-only PDF with no OCR fallback"
+    if l2.get("error") == "parse_failed":
+        return False, "Claude could not parse document content — text may be garbled or non-English"
+    return True, ""
+
+
+# ─────────────────────────────────────────────
+# TEMPORAL COHERENCE CHECK
+# Checks joining date vs PDF creation date vs today
+# ─────────────────────────────────────────────
+def check_temporal_coherence(l2, l3):
+    """Returns list of override signals with type and msg"""
+    signals = []
+    today = datetime.now()
+
+    joining_iso = l2.get("joining_date_iso")
+    meta = l3.get("metadata", {})
+    pdf_created_raw = meta.get("creationDate", "")
+
+    joining_dt = None
+    if joining_iso:
+        try:
+            joining_dt = datetime.strptime(joining_iso, "%Y-%m-%d")
+        except:
+            pass
+
+    if joining_dt:
+        # Joining date in the past (>60 days ago)
+        days_ago = (today - joining_dt).days
+        if days_ago > 60:
+            signals.append({
+                "type": "danger",
+                "msg": f"Joining date {joining_iso} is {days_ago} days in the past — offer letters are typically submitted before or near joining",
+                "override": "cap_score",
+                "cap": 50
+            })
+        # Joining date implausibly far in future (>18 months)
+        elif days_ago < -540:
+            signals.append({
+                "type": "warning",
+                "msg": f"Joining date {joining_iso} is more than 18 months away — unusually far future date",
+                "override": None
+            })
+
+    # PDF creation date vs joining date
+    if pdf_created_raw and joining_dt:
+        try:
+            # PyMuPDF format: D:20240115120000+05'30'
+            clean = pdf_created_raw.replace("D:", "")[:8]
+            pdf_created_dt = datetime.strptime(clean, "%Y%m%d")
+            delta_days = (pdf_created_dt - joining_dt).days
+            if delta_days > 30:
+                signals.append({
+                    "type": "danger",
+                    "msg": f"PDF was created {delta_days} days AFTER the stated joining date — document may have been fabricated retrospectively",
+                    "override": "cap_score",
+                    "cap": 40
+                })
+            elif delta_days > 0:
+                signals.append({
+                    "type": "warning",
+                    "msg": f"PDF creation date is {delta_days} days after joining date — borderline, may need review",
+                    "override": None
+                })
+            else:
+                signals.append({
+                    "type": "ok",
+                    "msg": f"PDF creation date ({pdf_created_dt.strftime('%Y-%m-%d')}) precedes joining date — temporally consistent",
+                    "override": None
+                })
+        except:
+            pass
+
+    return signals
+
+
+# ─────────────────────────────────────────────
+# CROSS-LAYER OVERRIDE ENGINE
+# Applies hard caps and floors based on combined signal logic
+# This runs AFTER individual layer scores are computed
+# ─────────────────────────────────────────────
+def apply_cross_layer_overrides(score, breakdown, l2, l3, l4, l5, temporal_signals):
+    """
+    Applies post-scoring overrides based on cross-layer logic.
+    Returns (final_score, overrides_applied: list of str)
+    """
+    overrides = []
+
+    # Count danger signals across all layers
+    all_signals = (
+        l3.get("signals", []) +
+        l4.get("signals", []) +
+        l5.get("signals", []) +
+        temporal_signals
+    )
+    danger_count = sum(1 for s in all_signals if s.get("type") == "danger")
+
+    # ── Override 1: Exact duplicate — hard cap at 25 ──
+    if l5.get("is_exact_duplicate"):
+        if score > 25:
+            score = 25
+            overrides.append(f"EXACT DUPLICATE detected — score capped at 25 regardless of other layers")
+
+    # ── Override 2: Too many danger signals — cap at 50 ──
+    if danger_count >= 3 and score > 50:
+        score = 50
+        overrides.append(f"{danger_count} danger signals across layers — score capped at 50 (REVIEW RECOMMENDED floor)")
+
+    # ── Override 3: Completeness too low — cap at 40 ──
+    completeness = l2.get("overall_completeness_score", 100)
+    missing = len(l2.get("missing_fields", []))
+    if completeness < 30 or missing >= 6:
+        if score > 40:
+            score = 40
+            overrides.append(f"Critical incompleteness ({completeness}% complete, {missing} missing fields) — score capped at 40")
+
+    # ── Override 4: Placeholder text detected ──
+    if l2.get("has_placeholder_text") is True:
+        if score > 35:
+            score = 35
+            overrides.append("Unfilled template placeholders detected — document appears to be a blank template, not a real offer letter. Score capped at 35.")
+
+    # ── Override 5: Free email used by employer ──
+    if l2.get("employer_email_is_free") is True:
+        email = l2.get("employer_email", "")
+        overrides.append(f"Employer using free email provider — legitimate employers use domain email. Penalty applied.")
+        score = max(0, score - 12)
+
+    # ── Override 6: Temporal coherence caps ──
+    for sig in temporal_signals:
+        if sig.get("override") == "cap_score":
+            cap = sig["cap"]
+            if score > cap:
+                score = cap
+                overrides.append(f"Temporal anomaly: {sig['msg'][:80]}... — score capped at {cap}")
+
+    return round(max(0, min(100, score)), 1), overrides
+
+
 def compute_confidence_score(l2, l3, l4, l5):
     """Compute overall authenticity confidence score (higher = more authentic)"""
+
+    # ── Hard gate: document type check ──
+    # If Claude determined this is not an offer letter, skip scoring entirely.
+    # A clean policy document should not score 60 just because its PDF metadata is fine.
+    is_offer_letter = l2.get("is_offer_letter", True)  # default True for backward compat
+    document_type = l2.get("document_type", "offer letter")
+    if is_offer_letter is False or (isinstance(is_offer_letter, str) and is_offer_letter.lower() == "false"):
+        return {
+            "score": 0,
+            "verdict": "NOT AN OFFER LETTER",
+            "color": "red",
+            "document_type": document_type,
+            "breakdown": {
+                "Document Type Gate": {
+                    "max": 100,
+                    "score": 0,
+                    "detail": f"Document classified as '{document_type}' — not an employment offer letter. Authenticity scoring does not apply."
+                }
+            }
+        }
+
     breakdown = {}
 
     # ── Layer 2: Field completeness (weight 30%) ──
@@ -598,6 +781,19 @@ def compute_confidence_score(l2, l3, l4, l5):
     total = sum(b["score"] for b in breakdown.values())
     total = max(0, min(100, total))
 
+    # Temporal coherence — run here so it has access to l2 and l3
+    temporal_signals = check_temporal_coherence(l2, l3)
+
+    # Cross-layer override engine
+    total, overrides = apply_cross_layer_overrides(total, breakdown, l2, l3, l4, l5, temporal_signals)
+
+    if overrides:
+        breakdown["⚡ Score Overrides Applied"] = {
+            "max": 0,
+            "score": 0,
+            "detail": " | ".join(overrides)
+        }
+
     if total >= 75:
         verdict = "LIKELY AUTHENTIC"
         color = "green"
@@ -608,7 +804,14 @@ def compute_confidence_score(l2, l3, l4, l5):
         verdict = "SUSPICIOUS — FLAG FOR MANUAL REVIEW"
         color = "red"
 
-    return {"score": round(total, 1), "verdict": verdict, "color": color, "breakdown": breakdown}
+    return {
+        "score": round(total, 1),
+        "verdict": verdict,
+        "color": color,
+        "breakdown": breakdown,
+        "overrides": overrides,
+        "temporal_signals": temporal_signals
+    }
 
 # ─────────────────────────────────────────────
 # ROUTES
@@ -650,6 +853,33 @@ def analyze():
     l2 = layer2_field_extraction(l1["text"], image_path)
     results["layer2"] = l2
 
+    # ── Input validation gate — abort before scoring if doc is unreadable ──
+    valid, reason = validate_inputs(l1, l2)
+    if not valid:
+        return jsonify({
+            "error": "insufficient_data",
+            "final_score": {
+                "score": 0,
+                "verdict": "CANNOT SCORE — INSUFFICIENT DATA",
+                "color": "red",
+                "breakdown": {
+                    "Input Validation": {
+                        "max": 100,
+                        "score": 0,
+                        "detail": reason
+                    }
+                },
+                "overrides": [reason],
+                "temporal_signals": []
+            },
+            "layer1": l1,
+            "layer2": l2,
+            "all_anomalies": [reason],
+            "candidate_name": "Unknown",
+            "employer_name": "Unknown",
+            "analyzed_at": datetime.now().isoformat()
+        })
+
     print("Running Layer 3: Metadata Forensics...")
     l3 = layer3_metadata_forensics(pdf_path)
     results["layer3"] = l3
@@ -680,6 +910,15 @@ def analyze():
         l6.get("anomalies", []) +
         (l2.get("suspicious_text_patterns", []) or [])
     )
+    # Add override reasons as anomalies so they show in the anomaly box
+    overrides = score_result.get("overrides", [])
+    all_anomalies += overrides
+
+    # Surface temporal signals as anomalies too if they are danger/warning
+    for ts in score_result.get("temporal_signals", []):
+        if ts.get("type") in ("danger", "warning"):
+            all_anomalies.append(ts["msg"])
+
     results["all_anomalies"] = all_anomalies
     results["candidate_name"] = l2.get("candidate_name", "Unknown Candidate")
     results["employer_name"] = l2.get("employer_name", "Unknown Employer")
@@ -1185,17 +1424,29 @@ function renderResults(data) {
   document.getElementById('analyze-btn').textContent = 'Run 6-Layer Analysis';
 
   const score = data.final_score;
+  const isNotOffer = score.verdict === 'NOT AN OFFER LETTER';
   const banner = document.getElementById('score-banner');
   banner.className = `score-banner ${score.color}`;
-  document.getElementById('score-num').textContent = score.score;
+  document.getElementById('score-num').textContent = isNotOffer ? '—' : score.score;
   document.getElementById('score-verdict').textContent = score.verdict;
-  document.getElementById('score-sub').textContent = `Based on 6-layer forensic analysis · ${new Date().toLocaleString()}`;
+  document.getElementById('score-sub').textContent = isNotOffer
+    ? `Document classified as: ${score.document_type || 'non-offer document'} · Authenticity scoring not applicable · ${new Date().toLocaleString()}`
+    : `Based on 6-layer forensic analysis · ${new Date().toLocaleString()}`;
 
   // Score Breakdown
   const breakdown = score.breakdown || {};
   const colorMap = { 'L2 Field Completeness': '#00d4aa', 'L3 Metadata Forensics': '#0088ff', 'L4 Visual Forensics': '#f59e0b', 'L5 Historical Match': '#a78bfa' };
   document.getElementById('score-breakdown-rows').innerHTML = Object.entries(breakdown).map(([key, val]) => {
-    const pct = (val.score / val.max) * 100;
+    // Special rendering for the override row
+    if (key.includes('Override')) {
+      return `
+        <div class="breakdown-row" style="background:rgba(245,158,11,0.07);border-radius:6px;padding:0.5rem;margin:0.25rem 0">
+          <div class="breakdown-label" style="color:var(--warn);font-size:0.75rem">⚡ ${key}</div>
+        </div>
+        <div class="breakdown-detail" style="color:var(--warn);padding-left:0">${val.detail}</div>
+      `;
+    }
+    const pct = val.max > 0 ? (val.score / val.max) * 100 : 0;
     const barColor = pct >= 70 ? 'var(--ok)' : pct >= 40 ? 'var(--warn)' : 'var(--danger)';
     return `
       <div class="breakdown-row">
@@ -1205,13 +1456,13 @@ function renderResults(data) {
       </div>
       <div class="breakdown-detail">${val.detail}</div>
     `;
-  }).join('') + `
+  }).join('') + (isNotOffer ? '' : `
     <div class="breakdown-row" style="border-top:1px solid var(--border);padding-top:0.75rem;margin-top:0.25rem">
       <div class="breakdown-label" style="font-weight:600">Total Score</div>
       <div class="breakdown-bar-wrap"><div class="breakdown-bar" style="width:${score.score}%;background:${score.color==='green'?'var(--ok)':score.color==='amber'?'var(--warn)':'var(--danger)'}"></div></div>
       <div class="breakdown-score" style="font-weight:600;color:${score.color==='green'?'var(--ok)':score.color==='amber'?'var(--warn)':'var(--danger)'}">${score.score} / 100</div>
     </div>
-  `;
+  `);
 
   // Anomalies
   const anomalies = data.all_anomalies || [];
@@ -1288,6 +1539,25 @@ function renderResults(data) {
   const l6 = data.layer6 || {};
   document.getElementById('l6-detail').innerHTML = renderSignals(l6.signals) +
     (l6.gps_coords?`<div class="signal ok"><div class="signal-dot"></div><div class="signal-text">GPS: ${l6.gps_coords.lat}, ${l6.gps_coords.lon}</div></div>`:'');
+
+  // Temporal coherence signals — injected into L3 card as they relate to dates
+  const temporalSignals = score.temporal_signals || [];
+  if (temporalSignals.length > 0) {
+    document.getElementById('l3-detail').innerHTML += `
+      <div style="margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid var(--border)">
+        <div style="font-family:var(--mono);font-size:0.65rem;color:var(--warn);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:0.4rem">Temporal Coherence</div>
+        ${renderSignals(temporalSignals)}
+      </div>`;
+  }
+
+  // Employer email flag
+  const emailFree = data.layer2?.employer_email_is_free;
+  const emailDomain = data.layer2?.employer_email_domain;
+  if (emailFree === true) {
+    document.getElementById('l1-detail').innerHTML += `<div class="signal danger"><div class="signal-dot"></div><div class="signal-text">Employer using free email (${emailDomain || 'unknown domain'}) — legitimate employers use domain email</div></div>`;
+  } else if (emailFree === false && emailDomain) {
+    document.getElementById('l1-detail').innerHTML += `<div class="signal ok"><div class="signal-dot"></div><div class="signal-text">Employer domain email: ${emailDomain}</div></div>`;
+  }
 
   // Refresh history
   fetch('/history').then(r=>r.json()).then(h => {
