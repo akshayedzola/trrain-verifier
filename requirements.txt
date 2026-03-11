@@ -1,0 +1,6 @@
+flask
+pymupdf
+anthropic
+pillow
+opencv-python-headless
+numpy
